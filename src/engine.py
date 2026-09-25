@@ -19,6 +19,8 @@ SUCCESS = "success"
 FAILURE = "failure"
 RUNNING = "running"
 
+_TERMINAL = (SUCCESS, FAILURE)
+
 
 @dataclass
 class Node:
@@ -35,6 +37,28 @@ class Node:
         for c in self.children:
             c.reset()
 
+    def abort(self):
+        """外部中断：终止运行中的子树。
+
+        对每个已进入但未退出的节点精确触发一次on_exit，
+        然后递归重置状态，保证中断后可重新tick且结果确定。
+        """
+        if self.status == RUNNING:
+            self.on_exit_count += 1
+        for child in self.children:
+            child.abort()
+        self.status = "idle"
+        self.running_index = 0
+
+    def _enter(self) -> None:
+        self.on_enter_count += 1
+        self.status = RUNNING
+
+    def _exit(self, result: str) -> str:
+        self.status = result
+        self.on_exit_count += 1
+        return result
+
 
 class Action(Node):
     def __init__(self, name: str, fn: Callable[[], str]):
@@ -42,104 +66,151 @@ class Action(Node):
         self.fn = fn
 
     def tick(self) -> str:
+        if self.status in _TERMINAL:
+            return self.status
         if self.status == "idle":
-            self.on_enter_count += 1
-            self.status = RUNNING
+            self._enter()
         result = self.fn()
         if result != RUNNING:
-            self.status = result
-            self.on_exit_count += 1
-        return result
+            return self._exit(result)
+        return RUNNING
 
 
 class Sequence(Node):
+    """按顺序执行；失败立即短路返回，running挂起并从当前子节点继续。"""
     def tick(self) -> str:
+        if self.status in _TERMINAL:
+            return self.status
         if self.status == "idle":
-            self.on_enter_count += 1
-            self.status = RUNNING
+            self._enter()
             self.running_index = 0
         while self.running_index < len(self.children):
             child = self.children[self.running_index]
             result = child.tick()
             if result == FAILURE:
-                self.status = FAILURE
-                self.on_exit_count += 1
-                return FAILURE
+                return self._exit(FAILURE)
             if result == RUNNING:
                 return RUNNING
             self.running_index += 1
-        self.status = SUCCESS
-        self.on_exit_count += 1
-        return SUCCESS
+        return self._exit(SUCCESS)
 
 
 class Selector(Node):
+    """按顺序尝试；成功立即返回，running挂起并下一帧从该子节点继续。"""
     def tick(self) -> str:
+        if self.status in _TERMINAL:
+            return self.status
         if self.status == "idle":
-            self.on_enter_count += 1
-            self.status = RUNNING
+            self._enter()
             self.running_index = 0
         while self.running_index < len(self.children):
             child = self.children[self.running_index]
             result = child.tick()
             if result == SUCCESS:
-                self.status = SUCCESS
-                self.on_exit_count += 1
-                return SUCCESS
+                return self._exit(SUCCESS)
             if result == RUNNING:
                 return RUNNING
             self.running_index += 1
-        self.status = FAILURE
-        self.on_exit_count += 1
-        return FAILURE
+        return self._exit(FAILURE)
 
 
 class Parallel(Node):
-    """并行节点。BUG：子节点失败时不终止其他子节点。"""
+    """并行节点。
+
+    - 任一子节点失败：立即终止所有仍在运行的子节点并返回failure；
+    - 全部子节点成功才返回success；
+    - 有子节点running时返回running，并记住已完成的子节点（不再重复tick）。
+    """
     def tick(self) -> str:
+        if self.status in _TERMINAL:
+            return self.status
         if self.status == "idle":
-            self.on_enter_count += 1
-            self.status = RUNNING
+            self._enter()
         all_success = True
-        any_failure = False
         for child in self.children:
-            if child.status in (SUCCESS, FAILURE):
-                if child.status == FAILURE:
-                    any_failure = True
+            if child.status in _TERMINAL:
                 continue
             result = child.tick()
             if result == FAILURE:
-                any_failure = True
-                # BUG：不终止其他正在running的子节点，继续遍历
-            elif result == RUNNING:
+                for other in self.children:
+                    if other is not child and other.status == RUNNING:
+                        other.abort()
+                return self._exit(FAILURE)
+            if result == RUNNING:
                 all_success = False
-            # result == SUCCESS: continue
-        if any_failure:
-            # BUG：应该先终止所有子节点再返回failure
-            self.status = FAILURE
-            self.on_exit_count += 1
-            return FAILURE
         if all_success:
-            self.status = SUCCESS
-            self.on_exit_count += 1
-            return SUCCESS
+            return self._exit(SUCCESS)
         return RUNNING
 
 
 class Inverter(Node):
+    """反转子节点结果；running原样透传。"""
     def tick(self) -> str:
+        if self.status in _TERMINAL:
+            return self.status
         if self.status == "idle":
-            self.on_enter_count += 1
-            self.status = RUNNING
+            self._enter()
         if not self.children:
-            self.status = FAILURE
-            return FAILURE
+            return self._exit(FAILURE)
         result = self.children[0].tick()
         if result == RUNNING:
             return RUNNING
-        self.status = SUCCESS if result == FAILURE else FAILURE
-        self.on_exit_count += 1
-        return self.status
+        return self._exit(SUCCESS if result == FAILURE else FAILURE)
+
+
+class Repeat(Node):
+    """重复执行子节点times次；子节点失败立即返回failure，running透传。"""
+    def __init__(self, name: str, children: Optional[List[Node]] = None,
+                 times: int = 1):
+        super().__init__(name, children or [])
+        self.times = times
+        self.completed = 0
+
+    def reset(self):
+        super().reset()
+        self.completed = 0
+
+    def abort(self):
+        super().abort()
+        self.completed = 0
+
+    def tick(self) -> str:
+        if self.status in _TERMINAL:
+            return self.status
+        if self.status == "idle":
+            self._enter()
+        if not self.children or self.times <= 0:
+            return self._exit(SUCCESS)
+        child = self.children[0]
+        while self.completed < self.times:
+            result = child.tick()
+            if result == RUNNING:
+                return RUNNING
+            if result == FAILURE:
+                return self._exit(FAILURE)
+            self.completed += 1
+            if self.completed < self.times:
+                child.reset()
+        return self._exit(SUCCESS)
+
+
+class UntilFail(Node):
+    """重复执行子节点直到其失败；子节点失败返回success，running透传。"""
+    def tick(self) -> str:
+        if self.status in _TERMINAL:
+            return self.status
+        if self.status == "idle":
+            self._enter()
+        if not self.children:
+            return self._exit(SUCCESS)
+        child = self.children[0]
+        while True:
+            result = child.tick()
+            if result == RUNNING:
+                return RUNNING
+            if result == FAILURE:
+                return self._exit(SUCCESS)
+            child.reset()
 
 
 class BehaviorTree:
@@ -153,6 +224,11 @@ class BehaviorTree:
 
     def reset(self):
         self.root.reset()
+        self.tick_count = 0
+
+    def interrupt(self):
+        """外部中断事件：终止运行中的节点并重置整棵树。"""
+        self.root.abort()
         self.tick_count = 0
 
     def snapshot(self) -> dict:
