@@ -42,6 +42,8 @@ class Action(Node):
         self.fn = fn
 
     def tick(self) -> str:
+        if self.status in (SUCCESS, FAILURE):
+            return self.status
         if self.status == "idle":
             self.on_enter_count += 1
             self.status = RUNNING
@@ -54,6 +56,8 @@ class Action(Node):
 
 class Sequence(Node):
     def tick(self) -> str:
+        if self.status in (SUCCESS, FAILURE):
+            return self.status
         if self.status == "idle":
             self.on_enter_count += 1
             self.status = RUNNING
@@ -75,6 +79,8 @@ class Sequence(Node):
 
 class Selector(Node):
     def tick(self) -> str:
+        if self.status in (SUCCESS, FAILURE):
+            return self.status
         if self.status == "idle":
             self.on_enter_count += 1
             self.status = RUNNING
@@ -95,44 +101,49 @@ class Selector(Node):
 
 
 class Parallel(Node):
-    """并行节点。BUG：子节点失败时不终止其他子节点。"""
+    """并行节点：任一子节点失败立即终止其余子节点并返回失败。"""
     def tick(self) -> str:
+        if self.status in (SUCCESS, FAILURE):
+            return self.status
         if self.status == "idle":
             self.on_enter_count += 1
             self.status = RUNNING
         all_success = True
-        any_failure = False
         for child in self.children:
-            if child.status in (SUCCESS, FAILURE):
-                if child.status == FAILURE:
-                    any_failure = True
+            if child.status == SUCCESS:
                 continue
+            if child.status == FAILURE:
+                return self._terminate_children_and_fail()
             result = child.tick()
             if result == FAILURE:
-                any_failure = True
-                # BUG：不终止其他正在running的子节点，继续遍历
-            elif result == RUNNING:
+                return self._terminate_children_and_fail()
+            if result == RUNNING:
                 all_success = False
-            # result == SUCCESS: continue
-        if any_failure:
-            # BUG：应该先终止所有子节点再返回failure
-            self.status = FAILURE
-            self.on_exit_count += 1
-            return FAILURE
         if all_success:
             self.status = SUCCESS
             self.on_exit_count += 1
             return SUCCESS
         return RUNNING
 
+    def _terminate_children_and_fail(self) -> str:
+        for child in self.children:
+            if child.status in (RUNNING, "idle"):
+                child.reset()
+        self.status = FAILURE
+        self.on_exit_count += 1
+        return FAILURE
+
 
 class Inverter(Node):
     def tick(self) -> str:
+        if self.status in (SUCCESS, FAILURE):
+            return self.status
         if self.status == "idle":
             self.on_enter_count += 1
             self.status = RUNNING
         if not self.children:
             self.status = FAILURE
+            self.on_exit_count += 1
             return FAILURE
         result = self.children[0].tick()
         if result == RUNNING:
