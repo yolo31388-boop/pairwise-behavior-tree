@@ -95,35 +95,34 @@ class Selector(Node):
 
 
 class Parallel(Node):
-    """并行节点。BUG：子节点失败时不终止其他子节点。"""
+    """并行节点。任一子节点失败立即终止其他子节点。"""
     def tick(self) -> str:
         if self.status == "idle":
             self.on_enter_count += 1
             self.status = RUNNING
         all_success = True
-        any_failure = False
-        for child in self.children:
+        for index, child in enumerate(self.children):
             if child.status in (SUCCESS, FAILURE):
-                if child.status == FAILURE:
-                    any_failure = True
                 continue
             result = child.tick()
             if result == FAILURE:
-                any_failure = True
-                # BUG：不终止其他正在running的子节点，继续遍历
+                self._terminate_others(index)
+                self.status = FAILURE
+                self.on_exit_count += 1
+                return FAILURE
             elif result == RUNNING:
                 all_success = False
             # result == SUCCESS: continue
-        if any_failure:
-            # BUG：应该先终止所有子节点再返回failure
-            self.status = FAILURE
-            self.on_exit_count += 1
-            return FAILURE
         if all_success:
             self.status = SUCCESS
             self.on_exit_count += 1
             return SUCCESS
         return RUNNING
+
+    def _terminate_others(self, failed_index: int):
+        for index, child in enumerate(self.children):
+            if index != failed_index and child.status == RUNNING:
+                child.reset()
 
 
 class Inverter(Node):
